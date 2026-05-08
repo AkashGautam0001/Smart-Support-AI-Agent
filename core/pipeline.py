@@ -1,3 +1,12 @@
+"""
+core/pipeline.py
+━━━━━━━━━━━━━━━
+Main orchestration pipeline. Connects all agents and components
+in the correct order: Guard → Analyze → Respond → QA → Optimize.
+
+This is the single entry point for processing any support ticket.
+"""
+
 import logging
 import time
 import uuid
@@ -13,15 +22,17 @@ from core.prompt_optimizer import PromptOptimizer
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class TicketRequest:
     message: str
     customer_name: str = "Customer"
-    customer_tier: str = "standard"
+    customer_tier: str = "standard"          # standard | premium | enterprise
     order_id: Optional[str] = None
     prior_contacts: int = 0
     account_age_months: int = 0
     ticket_id: str = field(default_factory=lambda: f"TKT-{uuid.uuid4().hex[:6].upper()}")
+
 
 @dataclass
 class TicketResponse:
@@ -54,6 +65,7 @@ class SupportPipeline:
 
     def __init__(self, api_key: Optional[str] = None):
         self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+
         self.guard = InjectionGuard(self.client, enable_semantic_check=True)
         self.analyzer = TicketAnalyzer(self.client)
         self.responder = ResponseGenerator(self.client)
@@ -96,14 +108,130 @@ class SupportPipeline:
                 processing_time_ms=round(elapsed, 1),
                 injection_blocked=True,
             )
+
         sanitized = guard_result.sanitized_input
 
-         # ── Step 2: Ticket Analysis (CoT) ─────────────────────────────────────
+        # ── Step 2: Ticket Analysis (CoT) ─────────────────────────────────────
         logger.info(f"[Pipeline] Step 2: CoT Analysis")
         analysis = self.analyzer.analyze(sanitized, ticket_id=ticket_id)
 
-         # Escalate if repeat contact + high priority
+        # Escalate if repeat contact + high priority
         if request.prior_contacts >= 2 and analysis["priority"] in ("high", "critical"):
             logger.info(f"[Pipeline] Auto-escalating {ticket_id} (repeat={request.prior_contacts} contacts)")
             analysis["category"] = "escalation"
             analysis["priority"] = "critical"
+
+        # ── Step 3: Response Generation ───────────────────────────────────────
+        logger.info(f"[Pipeline] Step 3: Generating {analysis['category']} response")
+
+        customer_context = {
+            "name": request.customer_name,
+            "tier": request.customer_tier,
+            "order_id": request.order_id,
+            "prior_contacts": request.prior_contacts,
+            "account_age_months": request.account_age_months,
+        }
+
+        # Premium customers get fewer shots (faster) since they get priority routing
+        n_shots = 1 if request.customer_tier == "enterprise" else 2
+        response_data = self.responder.generate(
+            sanitized_ticket=sanitized,
+            analysis=analysis,
+            customer_context=customer_context,
+            n_shots=n_shots,
+        )
+
+        draft_response = response_data.get("plain_text", "")
+        shot_technique = response_data.get("shot_technique", "unknown")
+
+        # ── Step 4: Quality Check ─────────────────────────────────────────────
+        logger.info(f"[Pipeline] Step 4: Quality Check")
+        qa_result = self.qa.check(
+            response_text=draft_response,
+            ticket_summary=analysis.get("summary", ""),
+            department=analysis["category"],
+        )
+
+        final_response = qa_result.get("approved_response") or draft_response
+        quality_score = qa_result.get("score", 70)
+        quality_passed = qa_result.get("passed", True)
+        quality_issues = qa_result.get("issues", [])
+
+        # ── Step 5: Log for Optimization ─────────────────────────────────────
+        self.optimizer.log_performance(
+            prompt_id=f"{analysis['category']}_default",
+            department=analysis["category"],
+            quality_score=quality_score,
+            issues=quality_issues,
+            shot_technique=shot_technique,
+            ticket_summary=analysis.get("summary", ""),
+        )
+
+        # ── Build final result ────────────────────────────────────────────────
+        elapsed = (time.time() - start_time) * 1000
+
+        result = TicketResponse(
+            ticket_id=ticket_id,
+            final_response=final_response,
+            department=analysis["category"],
+            priority=analysis["priority"],
+            sentiment=analysis["sentiment"],
+            quality_score=quality_score,
+            quality_passed=quality_passed,
+            shot_technique=shot_technique,
+            processing_time_ms=round(elapsed, 1),
+            injection_blocked=False,
+            analysis=analysis,
+            quality_issues=quality_issues,
+            tokens_used={
+                "analysis": {
+                    "input": analysis.get("input_tokens", 0),
+                    "output": analysis.get("output_tokens", 0),
+                },
+                "response": {
+                    "input": response_data.get("input_tokens", 0),
+                    "output": response_data.get("output_tokens", 0),
+                },
+            },
+        )
+
+        self._processed.append(result)
+        logger.info(
+            f"[Pipeline] {ticket_id} done in {elapsed:.0f}ms | "
+            f"dept={result.department} priority={result.priority} "
+            f"QA={quality_score}/100 ({'✓' if quality_passed else '⚠'})"
+        )
+        return result
+
+    def batch_process(self, requests: list[TicketRequest]) -> list[TicketResponse]:
+        """Process multiple tickets sequentially."""
+        return [self.process(req) for req in requests]
+
+    def full_report(self) -> dict:
+        """Aggregate stats across all processed tickets."""
+        if not self._processed:
+            return {"message": "No tickets processed yet."}
+
+        depts = {}
+        priorities = {}
+        for r in self._processed:
+            depts[r.department] = depts.get(r.department, 0) + 1
+            priorities[r.priority] = priorities.get(r.priority, 0) + 1
+
+        scores = [r.quality_score for r in self._processed]
+        times = [r.processing_time_ms for r in self._processed]
+        blocked = sum(1 for r in self._processed if r.injection_blocked)
+
+        return {
+            "tickets_processed": len(self._processed),
+            "injection_blocked": blocked,
+            "avg_quality_score": round(sum(scores) / len(scores), 1),
+            "avg_processing_ms": round(sum(times) / len(times), 1),
+            "by_department": depts,
+            "by_priority": priorities,
+            "qa_stats": self.qa.qa_summary(),
+            "analyzer_stats": self.analyzer.stats,
+            "responder_stats": self.responder.get_response_stats(),
+            "optimizer_report": self.optimizer.full_report(),
+            "threat_summary": self.guard.threat_summary(),
+        }
