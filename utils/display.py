@@ -13,6 +13,7 @@ from rich.rule import Rule
 from rich import box
 from rich.columns import Columns
 from rich.padding import Padding
+from core.pipeline import TicketResponse
 
 console = Console()
 

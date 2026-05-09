@@ -19,6 +19,11 @@ import os
 import argparse
 import logging
 import subprocess
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ANTHROPIC_API_KEY=os.getenv("ANTHROPIC_API_KEY")
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,7 +54,7 @@ def run_demo():
     console.print(f"[dim]Running demo with {len(SAMPLE_TICKETS)} sample tickets...[/dim]")
     console.print()
 
-    pipeline = SupportPipeline()
+    pipeline = SupportPipeline(api_key=ANTHROPIC_API_KEY)
 
     for i, ticket in enumerate(SAMPLE_TICKETS, 1):
         console.print(f"\n[dim]Ticket {i}/{len(SAMPLE_TICKETS)}[/dim]")
@@ -94,7 +99,7 @@ def run_interactive():
     )
 
     print_header()
-    pipeline = SupportPipeline()
+    pipeline = SupportPipeline(api_key=ANTHROPIC_API_KEY)
 
     console.print("[bold]Interactive Ticket Mode[/bold] — type your customer message\n")
 
@@ -155,7 +160,7 @@ def run_optimization(department: str):
     console = Console()
     console.print(f"\n[bold cyan]Running optimization analysis for: {department}[/bold cyan]\n")
 
-    pipeline = SupportPipeline()
+    pipeline = SupportPipeline(api_key=ANTHROPIC_API_KEY)
 
     # Process all tickets to build performance data
     console.print("[dim]Processing sample tickets to build performance data...[/dim]")
